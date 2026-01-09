@@ -1,0 +1,26 @@
+[package]
+name = "imgest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+zune-jpeg = "0.5.8"
+png = "0.18.0"
+gif = "0.14.1"
+image-webp = "0.2.4"
+image = "0.25.9"
+byteorder-lite = "0.1.0"
+
+[dev-dependencies]
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "macros", "chrono", "tls-rustls"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+async-stream = "0.3"
+futures-util = "0.3"
+indicatif = "0.18"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.9"
+futures = "0.3"
+pyo3 = { version = "0.27", features = ["auto-initialize"] }
