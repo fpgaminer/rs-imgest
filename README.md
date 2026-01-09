@@ -7,3 +7,6 @@ Dependency versions are pinned since we do a thorough decoding test on each rele
 * GIF
 * BMP
 * WEBP
+
+
+NOTE: Make sure to use the virtual env when running tests (.venv).
