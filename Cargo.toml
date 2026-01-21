@@ -11,6 +11,7 @@ gif = "0.14.1"
 image-webp = "0.2.4"
 image = "0.25.9"
 byteorder-lite = "0.1.0"
+zune-core = "0.5.0"
 
 [dev-dependencies]
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "macros", "chrono", "tls-rustls"] }

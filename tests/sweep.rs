@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use futures_util::StreamExt as _;
+use image::ImageFormat;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use pyo3::{
@@ -20,6 +21,9 @@ static PIL_IMAGE_MODULE: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
 const PNG_AVG_DIFF_LIMIT: f64 = 0.17;
 const PNG_MAX_DIFF_LIMIT: i64 = 1;
 
+const JPG_AVG_DIFF_LIMIT: f64 = 0.29;
+const JPG_MAX_DIFF_LIMIT: i64 = 20;
+
 
 #[tokio::test]
 async fn sweep_test() -> Result<()> {
@@ -30,9 +34,8 @@ async fn sweep_test() -> Result<()> {
 		.target(env_logger::Target::Pipe(Box::new(split)))
 		.try_init()?;
 
-	// Get Python pool ready
-	//let python_pool = PythonPool::new("python3", Path::new("tests/decoder_worker.py"), 16).await
-	//	.context("failed to create Python decoding pool")?;
+	// Disable python's handler so that Ctrl-C works properly
+	disable_python_sigint_handler();
 
 	// Fetch all image paths from bigasp database
 	let mut paths = fetch_paths().await?;
@@ -87,7 +90,7 @@ async fn test_loading_image(path: PathBuf) {
 		return;
 	};
 
-	let img = match res {
+	let (format, img) = match res {
 		Ok(img) => img,
 		Err(e) => {
 			log::error!("IMG_FAIL: Failed to load image at path {:?}: {:?}", path, e);
@@ -121,13 +124,18 @@ async fn test_loading_image(path: PathBuf) {
 		// For PNGs the limits are strict except in the case of 16-bit per channel images where we allow a small tolerance for 16->8 bit conversion differences
 		let is_16bit = img.color().bits_per_pixel() == 16 * (img.color().channel_count() as u16);
 		let img = img.into_rgba8();
-		let max_diff = if is_16bit { PNG_MAX_DIFF_LIMIT } else { 0 };
-		let avg_diff_limit = if is_16bit { PNG_AVG_DIFF_LIMIT } else { 0.0 };
+		let (max_diff, avg_diff_limit) = match format {
+			ImageFormat::Png if is_16bit => (PNG_MAX_DIFF_LIMIT, PNG_AVG_DIFF_LIMIT),
+			ImageFormat::Png => (0, 0.0),
+			ImageFormat::Jpeg => (JPG_MAX_DIFF_LIMIT, JPG_AVG_DIFF_LIMIT),
+			_ => (0, 0.0),
+		};
 
 		let rust_data = img.into_raw();
 		if rust_data.len() != python_data.len() {
 			return Err(format!(
-				"data length mismatch: Rust decoder gave {}, Python decoder gave {}",
+				"({:?}) data length mismatch: Rust decoder gave {}, Python decoder gave {}",
+				format,
 				rust_data.len(),
 				python_data.len()
 			));
@@ -146,8 +154,8 @@ async fn test_loading_image(path: PathBuf) {
 			// Only fail if the differences exceed the limits
 			if avg_diff > avg_diff_limit || diff_max > max_diff {
 				return Err(format!(
-					"pixel data mismatch, average difference per byte: {}, max difference: {}",
-					avg_diff, diff_max
+					"({:?})pixel data mismatch, average difference per byte: {}, max difference: {}",
+					format, avg_diff, diff_max
 				));
 			}
 		}
@@ -164,7 +172,7 @@ async fn test_loading_image(path: PathBuf) {
 		log::error!("IMG_FAIL: Image data mismatch at path {:?}: {}", path, msg);
 	}
 
-	log::info!("IMG_OK: Successfully loaded and verified image at path {:?}", path);
+	log::trace!("IMG_OK: Successfully loaded and verified image at path {:?}", path);
 }
 
 
@@ -267,6 +275,17 @@ fn decode_with_pillow(py: Python<'_>, path: &Path) -> PyResult<(u32, u32, Vec<u8
 }
 
 
+fn disable_python_sigint_handler() {
+	let _ = Python::attach(|py| -> PyResult<()> {
+		let signal = py.import("signal")?;
+		let sigint = signal.getattr("SIGINT")?;
+		let sig_dfl = signal.getattr("SIG_DFL")?;
+		signal.getattr("signal")?.call1((sigint, sig_dfl))?;
+		Ok(())
+	});
+}
+
+
 pub async fn python_decode_image(path: PathBuf) -> Result<(u32, u32, Vec<u8>), PyErr> {
 	let join_handle = tokio::task::spawn_blocking(move || {
 		// Attach this blocking thread to the Python interpreter and run Pillow
@@ -280,7 +299,7 @@ pub async fn python_decode_image(path: PathBuf) -> Result<(u32, u32, Vec<u8>), P
 
 #[tokio::test]
 async fn test_png_16bit_detection() -> Result<()> {
-	let img_16bit =
+	let (_, img_16bit) =
 		imgest::load_image("/home/night/deep-raid/datasets/boorus/originals/00/09/0009cab25a5c4abc950d9c11f1476f2fde602a61fb8dd1b9d333d8f432cafb23")?;
 	println!(
 		"Debug: bytes_per_pixel={}, has_alpha={}, has_color={}, bits_per_pixel={}, channel_count={}",

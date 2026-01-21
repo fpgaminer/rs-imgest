@@ -1,4 +1,5 @@
 mod error;
+mod jpeg_decoder;
 mod png_decoder;
 
 use std::{
@@ -12,7 +13,7 @@ use image::{DynamicImage, ImageFormat, guess_format};
 use crate::png_decoder::PngDecoder;
 
 
-pub fn load_image<P: AsRef<Path>>(path: P) -> Result<DynamicImage, error::Error> {
+pub fn load_image<P: AsRef<Path>>(path: P) -> Result<(ImageFormat, DynamicImage), error::Error> {
 	let file = File::open(path)?;
 	let mut reader = BufReader::new(file);
 
@@ -30,7 +31,13 @@ pub fn load_image<P: AsRef<Path>>(path: P) -> Result<DynamicImage, error::Error>
 			if decoder.is_animated() {
 				return Err(error::Error::Animated);
 			}
-			return DynamicImage::from_decoder(decoder).map_err(|e| e.into());
+			let img = DynamicImage::from_decoder(decoder)?;
+			return Ok((ImageFormat::Png, img));
+		},
+		ImageFormat::Jpeg => {
+			let decoder = jpeg_decoder::JpegDecoder::new(reader)?;
+			let img = DynamicImage::from_decoder(decoder)?;
+			return Ok((ImageFormat::Jpeg, img));
 		},
 		_ => {
 			return Err(error::Error::UnsupportedFormat);
