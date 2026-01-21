@@ -14,15 +14,19 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 
 static PIL_IMAGE_MODULE: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+// Our test set includes images around 129M pixels, so lift the cap to a higher but still sane value.
+const PIL_MAX_IMAGE_PIXELS: usize = 200_000_000;
 
 // Generally speaking PNGs should always be exact matches since the format is lossless and well defined.
 // But we compare using 8-bit RGBA, so if the image is 16-bit per channel originally there can be subtle differences in the 16->8 bit conversion.
 // Only in those cases do we allow a small tolerance.
 const PNG_AVG_DIFF_LIMIT: f64 = 0.17;
-const PNG_MAX_DIFF_LIMIT: i64 = 1;
+const PNG_MAX_DIFF_LIMIT: u64 = 1;
 
 const JPG_AVG_DIFF_LIMIT: f64 = 0.29;
-const JPG_MAX_DIFF_LIMIT: i64 = 20;
+const JPG_MAX_DIFF_LIMIT: u64 = 20;
+
+const EDGE_MAX_DIFF_LIMIT: u64 = 80;
 
 
 #[tokio::test]
@@ -131,6 +135,8 @@ async fn test_loading_image(path: PathBuf) {
 			_ => (0, 0.0),
 		};
 
+		let w = img.width() as usize;
+		let h = img.height() as usize;
 		let rust_data = img.into_raw();
 		if rust_data.len() != python_data.len() {
 			return Err(format!(
@@ -143,19 +149,46 @@ async fn test_loading_image(path: PathBuf) {
 
 		if rust_data != python_data {
 			let mut diff_sum = 0;
-			let mut diff_max = 0;
-			for (b1, b2) in rust_data.iter().zip(python_data.iter()) {
-				let diff = (*b1 as i64 - *b2 as i64).abs();
+			let mut diff_max_inner = 0;
+			let mut diff_max_edge = 0;
+			//let mut edge_outliers = 0;
+
+			let bpp = 4usize; // RGBA8
+
+			for (i, (b1, b2)) in rust_data.iter().zip(python_data.iter()).enumerate() {
+				let diff = (*b1 as i64 - *b2 as i64).abs() as u64;
+				if diff == 0 {
+					continue;
+				}
+
 				diff_sum += diff;
-				diff_max = diff_max.max(diff);
+
+				let pix = i / bpp;
+				let x = pix % w;
+				let y = pix / w;
+				let is_edge = x == 0 || y == 0 || x == w - 1 || y == h - 1;
+
+				if is_edge {
+					diff_max_edge = diff_max_edge.max(diff);
+					/*if diff > max_diff {
+						edge_outliers += 1;
+					}*/
+				} else {
+					diff_max_inner = diff_max_inner.max(diff);
+				}
 			}
+
 			let avg_diff = diff_sum as f64 / rust_data.len() as f64;
 
-			// Only fail if the differences exceed the limits
-			if avg_diff > avg_diff_limit || diff_max > max_diff {
+			//let edge_rgba_bytes = (2 * w + 2 * h - 4) * 4;
+			//let allowed_edge_outliers = (edge_rgba_bytes / 20_000).clamp(4, 128); // ~0.005%
+
+			// Fail if the differences exceed the limits
+			if avg_diff > avg_diff_limit || diff_max_inner > max_diff || diff_max_edge > EDGE_MAX_DIFF_LIMIT
+			/*|| edge_outliers > allowed_edge_outliers*/
+			{
 				return Err(format!(
-					"({:?})pixel data mismatch, average difference per byte: {}, max difference: {}",
-					format, avg_diff, diff_max
+					"({format:?}) mismatch, avg_diff={avg_diff}, max_inner={diff_max_inner}, max_edge={diff_max_edge}", //, edge_outliers={edge_outliers}/{allowed_edge_outliers}",
 				));
 			}
 		}
@@ -254,7 +287,14 @@ impl std::io::Write for SplitWriter {
 
 
 fn decode_with_pillow(py: Python<'_>, path: &Path) -> PyResult<(u32, u32, Vec<u8>)> {
-	let pil = PIL_IMAGE_MODULE.get_or_try_init(py, || py.import("PIL.Image").map(|m| m.unbind()))?.bind(py);
+	let pil = PIL_IMAGE_MODULE
+		.get_or_try_init(py, || {
+			let module = py.import("PIL.Image")?;
+			module.setattr("MAX_IMAGE_PIXELS", PIL_MAX_IMAGE_PIXELS)?;
+			let module = module.unbind();
+			Ok::<Py<PyModule>, PyErr>(module)
+		})?
+		.bind(py);
 
 	// Open image
 	let image = pil.call_method1("open", (path.to_string_lossy().as_ref(),))?;

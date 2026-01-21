@@ -14,10 +14,15 @@ fn main() {
 		Err(e) => {
 			eprintln!("Failed to load image {}: {:?}", input_path, e);
 			std::process::exit(1);
-		}
+		},
 	};
 
 	let raw_data = img.to_rgba8().into_raw();
 	std::fs::write(output_path, &raw_data).expect("Failed to write output raw file");
-	println!("Successfully decoded image {:?} to raw RGBA8 format, wrote {} bytes to {}", format, raw_data.len(), output_path);
+	println!(
+		"Successfully decoded image {:?} to raw RGBA8 format, wrote {} bytes to {}",
+		format,
+		raw_data.len(),
+		output_path
+	);
 }
