@@ -4,7 +4,7 @@ mod png_decoder;
 
 use std::{
 	fs::File,
-	io::{BufReader, Read as _, Seek},
+	io::{BufRead, BufReader, Seek},
 	path::Path,
 };
 
@@ -13,10 +13,7 @@ use image::{DynamicImage, ImageFormat, guess_format};
 use crate::png_decoder::PngDecoder;
 
 
-pub fn load_image<P: AsRef<Path>>(path: P) -> Result<(ImageFormat, DynamicImage), error::Error> {
-	let file = File::open(path)?;
-	let mut reader = BufReader::new(file);
-
+pub fn load_image_from_reader<R: BufRead + Seek>(mut reader: R) -> Result<(ImageFormat, DynamicImage), error::Error> {
 	// Guess format
 	let mut buf = [0; 16];
 	reader.read_exact(&mut buf)?;
@@ -45,4 +42,12 @@ pub fn load_image<P: AsRef<Path>>(path: P) -> Result<(ImageFormat, DynamicImage)
 			return Ok((format, img));
 		},
 	}
+}
+
+
+pub fn load_image<P: AsRef<Path>>(path: P) -> Result<(ImageFormat, DynamicImage), error::Error> {
+	let file = File::open(path)?;
+	let reader = BufReader::new(file);
+
+	load_image_from_reader(reader)
 }
