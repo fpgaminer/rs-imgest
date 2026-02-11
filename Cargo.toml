@@ -5,14 +5,14 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-zune-jpeg = { git = "https://github.com/etemesi254/zune-image.git", rev = "13edc8d07f1572f149f83c59cf861211042c9874" }
+zune-jpeg = "=0.5.12"
 #zune-jpeg = { path = "zune-image/crates/zune-jpeg" }
 png = "=0.18.0"
 gif = "=0.14.1"
 image-webp = "=0.2.4"
 image = "=0.25.9"
 byteorder-lite = "0.1.0"
-zune-core = { git = "https://github.com/etemesi254/zune-image.git", rev = "13edc8d07f1572f149f83c59cf861211042c9874" }
+zune-core = "=0.5.1"
 #zune-core = { path = "zune-image/crates/zune-core" }
 
 [dev-dependencies]
