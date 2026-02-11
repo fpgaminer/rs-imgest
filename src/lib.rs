@@ -40,7 +40,9 @@ pub fn load_image<P: AsRef<Path>>(path: P) -> Result<(ImageFormat, DynamicImage)
 			return Ok((ImageFormat::Jpeg, img));
 		},
 		_ => {
-			return Err(error::Error::UnsupportedFormat);
+			// Use the image crate directly for other formats
+			let img = image::load(reader, format)?;
+			return Ok((format, img));
 		},
 	}
 }

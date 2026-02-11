@@ -3,3 +3,5 @@ Cargo.lock
 *.log
 *.png
 *.bin
+.vscode
+*.csv

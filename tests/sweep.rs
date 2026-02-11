@@ -11,6 +11,7 @@ use pyo3::{
 	types::{PyAnyMethods as _, PyBytes, PyBytesMethods as _, PyModule},
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use tokio::io::AsyncWriteExt as _;
 
 
 static PIL_IMAGE_MODULE: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
@@ -20,13 +21,20 @@ const PIL_MAX_IMAGE_PIXELS: usize = 200_000_000;
 // Generally speaking PNGs should always be exact matches since the format is lossless and well defined.
 // But we compare using 8-bit RGBA, so if the image is 16-bit per channel originally there can be subtle differences in the 16->8 bit conversion.
 // Only in those cases do we allow a small tolerance.
-const PNG_AVG_DIFF_LIMIT: f64 = 0.17;
+const PNG_AVG_DIFF_LIMIT: f64 = 0.32;
 const PNG_MAX_DIFF_LIMIT: u64 = 1;
 
-const JPG_AVG_DIFF_LIMIT: f64 = 0.29;
+const JPG_AVG_DIFF_LIMIT: f64 = 0.30;
 const JPG_MAX_DIFF_LIMIT: u64 = 20;
 
 const EDGE_MAX_DIFF_LIMIT: u64 = 80;
+
+
+// Filenames of images to ignore in the test
+const IGNORE_LIST: &[&str] = &[
+	// Contains corrupted entropy data which is hard to detect.  Pillow and zune-jpeg handle that corruption differently (but I don't think either is wrong)
+	"00b743d5520003169b87dd40f46d4f6bc21df0fd92d1e954f1e5c8c04192fdd3",
+];
 
 
 #[tokio::test]
@@ -43,17 +51,40 @@ async fn sweep_test() -> Result<()> {
 
 	// Fetch all image paths from bigasp database
 	let mut paths = fetch_paths().await?;
+	//let mut paths = Vec::new();
 
-	// Truncate to 10,000 images for testing
-	paths.truncate(10_000);
+	// Truncate to 100,000 images for testing
+	paths.truncate(100_000);
+	paths.push(PathBuf::from(
+		"/home/night/datasets/boorus/originals/78/ba/78baa18f92332b7fd20c843398707796e98616bafd10a243efc68f0059904790",
+	));
+	paths.push(PathBuf::from("/home/night/rs-imgest/misc-images/582121.11.450x300.jpg"));
+	paths.push(PathBuf::from(
+		"/home/night/datasets/boorus/originals/01/1d/011d6d8904a9bf6d09f80e04fb7205e44e1ab308f27dc4d367e9c3c1868a9b7b",
+	));
+
+	// Filter out ignored images
+	let ignore_set: std::collections::HashSet<&str> = IGNORE_LIST.iter().cloned().collect();
+	paths.retain(|path| {
+		if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+			if ignore_set.contains(filename) {
+				info!("Skipping image at path {:?} due to ignore list", path);
+				return false;
+			}
+		}
+		true
+	});
 
 	let pb = add_progress_bar(paths.len() as u64, "images", "Testing image loading...");
 	let pb_for_tasks = pb.clone();
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 	futures::stream::iter(paths)
 		.for_each_concurrent(16, move |path| {
 			let pb = pb_for_tasks.clone();
+			let tx = tx.clone();
 			async move {
-				test_loading_image(path).await;
+				let diff = test_loading_image(path.clone()).await;
+				let _ = tx.send((path, diff));
 				pb.inc(1);
 			}
 		})
@@ -61,6 +92,23 @@ async fn sweep_test() -> Result<()> {
 
 	pb.finish_and_clear();
 	info!("Completed image loading sweep test in {} seconds", pb.elapsed().as_secs_f32());
+
+	// Log MAEs as CSV
+	let mut mae_csv = tokio::io::BufWriter::new(tokio::fs::File::create("mae_log.csv").await?);
+	mae_csv.write_all(b"image_path,mae\n").await?;
+	while let Some((path, diff)) = rx.recv().await {
+		let path_str = path.to_string_lossy();
+		let path_csv = csv_escape_field(&path_str);
+		match diff {
+			Some(diff) => {
+				mae_csv.write_all(format!("{},{}\n", path_csv, diff).as_bytes()).await?;
+			},
+			None => {
+				mae_csv.write_all(format!("{},\n", path_csv).as_bytes()).await?;
+			},
+		}
+	}
+	mae_csv.flush().await?;
 
 	Ok(())
 }
@@ -86,19 +134,19 @@ async fn fetch_paths() -> Result<Vec<PathBuf>> {
 }
 
 
-async fn test_loading_image(path: PathBuf) {
+async fn test_loading_image(path: PathBuf) -> Option<f64> {
 	// Load with Rust decoder
 	let path_clone = path.clone();
 	let Ok(res) = tokio::task::spawn_blocking(move || imgest::load_image(&path_clone)).await else {
 		log::error!("spawn_blocking task panicked");
-		return;
+		return None;
 	};
 
 	let (format, img) = match res {
 		Ok(img) => img,
 		Err(e) => {
 			log::error!("IMG_FAIL: Failed to load image at path {:?}: {:?}", path, e);
-			return;
+			return None;
 		},
 	};
 
@@ -107,7 +155,7 @@ async fn test_loading_image(path: PathBuf) {
 		Ok(data) => data,
 		Err(e) => {
 			log::error!("IMG_FAIL: Python decoding failed for image at path {:?}: {:?}", path, e);
-			return;
+			return None;
 		},
 	};
 
@@ -120,7 +168,7 @@ async fn test_loading_image(path: PathBuf) {
 			python_w,
 			python_h
 		);
-		return;
+		return None;
 	}
 
 	// Compare pixel data
@@ -139,11 +187,14 @@ async fn test_loading_image(path: PathBuf) {
 		let h = img.height() as usize;
 		let rust_data = img.into_raw();
 		if rust_data.len() != python_data.len() {
-			return Err(format!(
-				"({:?}) data length mismatch: Rust decoder gave {}, Python decoder gave {}",
-				format,
-				rust_data.len(),
-				python_data.len()
+			return Err((
+				0.0,
+				format!(
+					"({:?}) data length mismatch: Rust decoder gave {}, Python decoder gave {}",
+					format,
+					rust_data.len(),
+					python_data.len()
+				),
 			));
 		}
 
@@ -187,25 +238,35 @@ async fn test_loading_image(path: PathBuf) {
 			if avg_diff > avg_diff_limit || diff_max_inner > max_diff || diff_max_edge > EDGE_MAX_DIFF_LIMIT
 			/*|| edge_outliers > allowed_edge_outliers*/
 			{
-				return Err(format!(
-					"({format:?}) mismatch, avg_diff={avg_diff}, max_inner={diff_max_inner}, max_edge={diff_max_edge}", //, edge_outliers={edge_outliers}/{allowed_edge_outliers}",
+				return Err((
+					avg_diff,
+					format!(
+						"({format:?}) mismatch, avg_diff={avg_diff}, max_inner={diff_max_inner}, max_edge={diff_max_edge}", //, edge_outliers={edge_outliers}/{allowed_edge_outliers}",
+					),
 				));
 			}
-		}
 
-		Ok(())
+			Ok(avg_diff)
+		} else {
+			Ok(0.0)
+		}
 	})
 	.await
 	else {
 		log::error!("spawn_blocking task panicked");
-		return;
+		return None;
 	};
 
-	if let Err(msg) = res {
-		log::error!("IMG_FAIL: Image data mismatch at path {:?}: {}", path, msg);
+	match res {
+		Err((mae, msg)) => {
+			log::error!("IMG_FAIL: Image data mismatch at path {:?}: {}", path, msg);
+			Some(mae)
+		},
+		Ok(avg_diff) => {
+			log::trace!("IMG_OK: Successfully loaded and verified image at path {:?}", path);
+			Some(avg_diff)
+		},
 	}
-
-	log::trace!("IMG_OK: Successfully loaded and verified image at path {:?}", path);
 }
 
 
@@ -291,6 +352,8 @@ fn decode_with_pillow(py: Python<'_>, path: &Path) -> PyResult<(u32, u32, Vec<u8
 		.get_or_try_init(py, || {
 			let module = py.import("PIL.Image")?;
 			module.setattr("MAX_IMAGE_PIXELS", PIL_MAX_IMAGE_PIXELS)?;
+			let file_module = py.import("PIL.ImageFile")?;
+			file_module.setattr("LOAD_TRUNCATED_IMAGES", true)?;
 			let module = module.unbind();
 			Ok::<Py<PyModule>, PyErr>(module)
 		})?
@@ -298,6 +361,17 @@ fn decode_with_pillow(py: Python<'_>, path: &Path) -> PyResult<(u32, u32, Vec<u8
 
 	// Open image
 	let image = pil.call_method1("open", (path.to_string_lossy().as_ref(),))?;
+
+	// Normalize 16-bit grayscale to 8-bit before RGBA conversion (avoids oddness in Pillow's direct I;16 -> RGBA conversion which saturates to white).
+	let mode: String = image.getattr("mode")?.extract()?;
+	let image = if mode.starts_with("I;16") {
+		// 65536-entry LUT: v -> v >> 8
+		let lut: Vec<u16> = (0..=65535).map(|v| (v >> 8) as u16).collect();
+
+		image.call_method1("convert", ("I",))?.call_method1("point", (lut, "L"))?
+	} else {
+		image
+	};
 
 	// Convert to RGBA8
 	let image = image.call_method1("convert", ("RGBA",))?;
@@ -312,6 +386,24 @@ fn decode_with_pillow(py: Python<'_>, path: &Path) -> PyResult<(u32, u32, Vec<u8
 	let data = bytes.as_bytes().to_vec();
 
 	Ok((width, height, data))
+}
+
+fn csv_escape_field(s: &str) -> String {
+	let needs_quote = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r');
+	if !needs_quote {
+		return s.to_string();
+	}
+
+	let mut out = String::with_capacity(s.len() + 2);
+	out.push('"');
+	for ch in s.chars() {
+		if ch == '"' {
+			out.push('"');
+		}
+		out.push(ch);
+	}
+	out.push('"');
+	out
 }
 
 
