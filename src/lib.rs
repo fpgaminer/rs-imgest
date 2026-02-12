@@ -36,6 +36,18 @@ pub fn load_image_from_reader<R: BufRead + Seek>(mut reader: R) -> Result<(Image
 			let img = DynamicImage::from_decoder(decoder)?;
 			return Ok((ImageFormat::Jpeg, img));
 		},
+		ImageFormat::WebP => {
+			let dec = image::codecs::webp::WebPDecoder::new(reader)?;
+			if dec.has_animation() {
+				return Err(error::Error::Animated);
+			}
+			let img = DynamicImage::from_decoder(dec)?;
+			return Ok((ImageFormat::WebP, img));
+		},
+		ImageFormat::Gif => {
+			// TODO: Technically a GIF could be static, but we'll just treat all GIFs as animated for simplicity for now
+			return Err(error::Error::Animated);
+		},
 		_ => {
 			// Use the image crate directly for other formats
 			let img = image::load(reader, format)?;
